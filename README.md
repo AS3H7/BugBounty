@@ -1,208 +1,118 @@
-# Tesla Bug Bounty — Recon & Testing Toolkit
+# BookBeat Bug Bounty — Testing Toolkit (YesWeHack)
 
-> **Authorized testing only.** This toolkit is for use against Tesla's public bug bounty program on [Bugcrowd](https://bugcrowd.com/tesla). All testing must follow Tesla's Rules of Engagement. Use your own accounts. Never access other users' data.
+> **Authorized testing only**, under BookBeat's YesWeHack program. This toolkit is built to **respect the program's Rules of Engagement** — especially the bans on automated scanners / high-traffic tooling and the mandatory ` yeswehack ` User-Agent.
 
 ---
 
-## Repository Structure
+## ⚠️ Read This First
+
+BookBeat's rules are strict. This toolkit enforces them, but you must too:
+
+1. **Every request carries the ` yeswehack ` User-Agent** — or you get blocked. `bb-request.sh` and friends inject it automatically.
+2. **No automated scanners / no high-traffic tools.** Recon here is **passive only** (third-party archives). Active testing is **manual, one request at a time, rate-limited**.
+3. **No DoS, no service degradation.**
+4. **Never copy/leak/modify user data.** If you reach another user's data, stop, take minimal proof, report.
+5. **Use YesWeHack email aliases** for registration and contact forms.
+6. **No public disclosure.**
+
+See **`scope.md`** for the full in/out-of-scope reference.
+
+---
+
+## Repository Layout
 
 ```
 BugBounty/
-├── README.md                    # You are here
-├── scope.md                     # In-scope/out-of-scope targets & bug classes
-├── recon/
-│   ├── install.sh               # One-command tool installer
-│   ├── tesla_recon.sh           # Main recon pipeline (5 phases)
-│   ├── endpoint_discovery.sh    # Targeted endpoint & param mining
-│   └── wordlists/
-│       ├── resolvers.txt        # Public DNS resolvers
-│       ├── subdomains.txt       # (downloaded by install.sh)
-│       └── README.md            # Wordlist download instructions
-├── targets/                     # (create per-host notes as you test)
-└── reports/                     # (store report drafts here)
+├── README.md                  # You are here
+├── scope.md                   # In/out-of-scope assets, rules, bug classes
+├── bookbeat/
+│   ├── config.sh              # Central config: UA, headers, hosts, rate limit, scope guard
+│   ├── api_login.sh           # Authenticate (your own account) -> cache token
+│   ├── bb-request.sh          # Safe curl wrapper (enforces UA + scope guard + delay)
+│   ├── idor_check.sh          # Two-account IDOR/BAC test harness (safe, no harvesting)
+│   ├── passive_recon.sh       # PASSIVE recon (third-party archives only)
+│   ├── METHODOLOGY.md         # Where the bugs are + how to hunt them
+│   └── output/                # Recon output (gitignored)
+├── reports/
+│   └── TEMPLATE.md            # Report structure for YesWeHack submissions
+└── targets/                   # Your per-endpoint notes
 ```
 
 ---
 
 ## Quick Start
 
-### 1. Install tools
-
+### 1. Set your credentials (in your shell — never commit)
 ```bash
-cd recon
-chmod +x install.sh
-./install.sh
+export BB_USERNAME="your-ywh-alias@example.com"
+export BB_PASSWORD="your-password"
 ```
 
-This installs all required tools (Go-based, Python, binaries) and downloads wordlists. Requires:
-- **Go 1.21+**
-- **Python 3.8+**
-- `curl`, `git`, `jq`
-
-### 2. (Optional) Set API keys for better coverage
-
+### 2. Passive recon (safe — no traffic to BookBeat)
 ```bash
-# GitHub token — enables github-subdomains (finds subs leaked in code)
-export GITHUB_TOKEN=ghp_your_token_here
-
-# ProjectDiscovery Cloud Platform — enables chaos dataset
-export PDCP_API_KEY=your_key_here
+cd bookbeat
+./passive_recon.sh
+# Review output/passive_*/SUMMARY.md, api_endpoints.txt, idor_candidates.txt
 ```
 
-### 3. Run the full recon pipeline
-
+### 3. Authenticate
 ```bash
-chmod +x tesla_recon.sh
-./tesla_recon.sh
+./api_login.sh                                   # primary account -> /tmp/.bb_token
+BB_TOKEN_FILE=/tmp/.bb_A ./api_login.sh          # account A (for IDOR)
+export BB_USERNAME=B@alias BB_PASSWORD=...; BB_TOKEN_FILE=/tmp/.bb_B ./api_login.sh   # account B
 ```
 
-This runs all 5 phases sequentially. Output is saved to `recon/output/<timestamp>/`.
-
-### 4. Or run individual phases
-
+### 4. Manual, surgical requests (UA + scope guard + rate limit enforced)
 ```bash
-./tesla_recon.sh --phase enum       # Phase 1: Subdomain enumeration
-./tesla_recon.sh --phase resolve    # Phase 2: DNS resolution + takeover check
-./tesla_recon.sh --phase probe      # Phase 3: HTTP probing (live hosts)
-./tesla_recon.sh --phase finger     # Phase 4: Tech fingerprinting + JS analysis
-./tesla_recon.sh --phase triage     # Phase 5: Categorize & prioritize
+./bb-request.sh GET https://api.bookbeat.com/api/my/books --auth --verbose
+./bb-request.sh GET "https://search-api.bookbeat.com/search?q=test" --verbose
 ```
 
-### 5. Deep-dive on a specific target
-
-Once triage identifies high-value hosts (apps with auth, APIs), run endpoint discovery:
-
+### 5. Test an IDOR candidate safely
 ```bash
-chmod +x endpoint_discovery.sh
-./endpoint_discovery.sh https://some-interesting-app.tesla.com
+# Find one of YOUR OWN resource IDs as account A, then:
+./idor_check.sh https://api.bookbeat.com/api/my/bookmarks/<your_A_id>
+```
+
+### 6. Write up findings
+```bash
+cp reports/TEMPLATE.md reports/idor-bookmarks.md   # then fill it in
 ```
 
 ---
 
-## Pipeline Overview
+## Dependencies
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         RECON PIPELINE                               │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  Phase 1: ENUMERATE                                                 │
-│  ┌─────────────┐ ┌──────────┐ ┌─────────────┐ ┌────────┐         │
-│  │  subfinder   │ │  amass   │ │ assetfinder │ │ crt.sh │  ...    │
-│  └──────┬──────┘ └────┬─────┘ └──────┬──────┘ └───┬────┘         │
-│         └──────────────┴──────────────┴────────────┘               │
-│                         │                                           │
-│                         ▼                                           │
-│              all_subdomains.txt (deduplicated, OOS filtered)        │
-│                         │                                           │
-│  Phase 2: RESOLVE       ▼                                           │
-│  ┌──────────────────────────────────────┐                          │
-│  │  dnsx — A/AAAA/CNAME records         │                          │
-│  │  + dangling CNAME detection          │                          │
-│  └──────────────────┬───────────────────┘                          │
-│                     │                                               │
-│  Phase 3: PROBE     ▼                                               │
-│  ┌──────────────────────────────────────┐                          │
-│  │  httpx — status, title, tech, length │                          │
-│  └──────────────────┬───────────────────┘                          │
-│                     │                                               │
-│  Phase 4: FINGERPRINT  ▼                                            │
-│  ┌──────────────────────────────────────┐                          │
-│  │  nuclei tech-detect                  │                          │
-│  │  JS file extraction + secret grep    │                          │
-│  │  API endpoint extraction             │                          │
-│  └──────────────────┬───────────────────┘                          │
-│                     │                                               │
-│  Phase 5: TRIAGE    ▼                                               │
-│  ┌──────────────────────────────────────┐                          │
-│  │  Categorize into:                    │                          │
-│  │    • Apps with auth (HIGH VALUE)     │                          │
-│  │    • API endpoints                   │                          │
-│  │    • Static/marketing (low value)    │                          │
-│  │    • Redirects / errors              │                          │
-│  └──────────────────────────────────────┘                          │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
+Minimal, by design (we're not running scanners):
+- `curl`, `jq` (required)
+- `gau`, `waybackurls`, `unfurl` (optional — passive recon; if absent, the Wayback CDX API fallback still works)
+
+Install the optional passive tools:
+```bash
+go install github.com/lc/gau/v2/cmd/gau@latest
+go install github.com/tomnomnom/waybackurls@latest
+go install github.com/tomnomnom/unfurl@latest
 ```
 
 ---
 
-## What to Do with Results
+## Methodology Summary
 
-After the pipeline runs, check these files in order:
+The scope is narrow and API-heavy. Aim, in order:
 
-| Priority | File | Action |
-|---|---|---|
-| 1 | `triage/apps_with_auth.txt` | These have login/dashboards — test for IDOR, BAC, ATO |
-| 2 | `triage/api_hosts.txt` | API endpoints — test authz, injection, logic |
-| 3 | `fingerprinted/potential_secrets.txt` | Leaked keys/tokens in JS — verify & report |
-| 4 | `fingerprinted/api_endpoints.txt` | Hidden API paths — fuzz with your own auth |
-| 5 | `resolved/takeover_candidates.txt` | Dangling CNAMEs — verify takeover is possible |
-| 6 | `triage/server_errors.txt` | 5xx responses — might indicate misconfigs |
+1. **IDOR / BAC** — other users' library, profile, payment, reading progress
+2. **Business logic** — premium content without paying, subscription/tier abuse, family-seat abuse
+3. **Auth / privilege escalation** — token scoping across the 3 APIs, JWT tampering
+4. **Injection** — search-api is the prime SQLi/XSS surface
+5. **SSRF / XXE / LFI** — any fetch/import/upload (blind SSRF w/o PoC = out)
+6. **CORS / CSRF / open redirect** — only with real impact
 
----
-
-## Testing Methodology (Post-Recon)
-
-Once you have high-value targets identified:
-
-### IDOR / Broken Access Control
-1. Create **two of your own accounts** (Account A, Account B)
-2. Perform actions as Account A, capture object IDs (order IDs, user IDs, etc.)
-3. Replay the request as Account B — does it work? That's IDOR.
-4. Check both **read** (GET) and **write** (PUT/POST/DELETE) operations.
-
-### SSRF
-1. Look for any "fetch URL", "import", "webhook", "PDF export", "image from URL" features
-2. Test with Burp Collaborator / interact.sh to confirm out-of-band callbacks
-3. Try `http://169.254.169.254/latest/meta-data/` for cloud metadata access
-
-### Auth Logic / Account Takeover
-1. Test password reset flows (token predictability, token reuse, no rate limit)
-2. Check OAuth flows for redirect_uri manipulation
-3. Test session handling (fixation, token leakage in URLs/referrer)
-
-### SQL Injection
-1. Focus on search, filter, sort parameters
-2. Try in unexpected places: headers, cookies, JSON body values
-3. Use time-based blind techniques against WAF-protected targets
-
----
-
-## Rules of Engagement — Reminders
-
-- **Own accounts only.** Never touch another user's data.
-- **Stop & report within 24h** if you discover access to someone else's data.
-- **No DoS / brute force** without written approval.
-- **No form spam** — be surgical, not noisy.
-- **Register with** `username@bugcrowdninja.com`.
-- **Delete any inadvertently accessed data** and prove deletion.
-
-See `scope.md` for the full in-scope/out-of-scope reference.
-
----
-
-## Options & Flags
-
-```
-tesla_recon.sh options:
-  --phase <name>    Run a specific phase: enum, resolve, probe, finger, triage
-  --threads <N>     Thread count (default: 50)
-  --output <DIR>    Custom output directory
-  -h, --help        Show help
-
-endpoint_discovery.sh:
-  Usage: ./endpoint_discovery.sh <target_url>
-```
-
----
-
-## Contributing
-
-This is a private research repo. Add your findings, custom wordlists, and target notes as you discover them. Keep sensitive data (tokens, credentials, PII) **out of git** — use `.gitignore`.
+Full details: **`bookbeat/METHODOLOGY.md`**.
 
 ---
 
 ## Disclaimer
 
-This toolkit is for **authorized security research only** under Tesla's public bug bounty program. Unauthorized access to computer systems is illegal. Always follow the program's Rules of Engagement and applicable laws.
+For **authorized** participation in BookBeat's YesWeHack bug bounty program only.
+Follow the program rules and the law. Test only your own accounts. Never access
+data that isn't yours.

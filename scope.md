@@ -1,76 +1,102 @@
-# Tesla Bug Bounty — Scope Reference
+# BookBeat Bug Bounty — Scope Reference (YesWeHack)
 
-## In-Scope Domains
+Audiobook/eBook subscription service. Narrow scope — **only the assets listed below are in scope. Everything else (all other domains/subdomains) is OUT of scope.**
 
-| Domain Pattern | Notes |
-|---|---|
-| `*.tesla.com` | Main web properties (Akamai CDN, Drupal, Varnish, CloudFlare) |
-| `*.teslamotors.com` | Legacy domain, still active |
-| `*.tesla.cn` | China-specific properties (Akamai, CloudFlare, Drupal) |
-| `*.tesla.services` | Services infrastructure |
-| `*.solarcity.com` | Solar/energy acquisition |
-| `*.teslainsuranceservices.com` | Insurance vertical |
-| Any host verified to be owned by Tesla Motors Inc. | Domains, IP space, etc. |
-| Official Tesla iOS app | https://apps.apple.com/us/app/tesla/id582007913 |
-| Official Tesla Android app | https://play.google.com/store/apps/details?id=com.teslamotors.tesla |
+## In-Scope Assets
 
-## Out-of-Scope Hosts (DO NOT TEST)
-
-- `employeefeedback.tesla.com`
-- `energysupport.tesla.com`
-- `engage.tesla.com` / `*.engage.tesla.com`
-- `feedback.tesla.com` / `feedback.teslamotors.com`
-- `ir.tesla.com` / `ir.teslamotors.com`
-- `mkto.teslamotors.com`
-- `shop.eu.teslamotors.com`
-- `service.tesla.com/docs/*` / `service.tesla.cn/docs/*`
-- Any acquisition domains (e.g., `maxwell.com`)
-- Any third-party hosted sites
-- Superchargers and related infrastructure
-
-## In-Scope Bug Classes (Prioritized)
-
-| Priority | Class | Expected Payout |
+| Asset | Type | Asset Value |
 |---|---|---|
-| 1 | IDOR / Broken Access Control | P1–P2 ($500–$10k) |
-| 2 | SSRF (cloud metadata pivot) | P1–P2 |
-| 3 | Auth/Authz logic & Account Takeover (non-MFA) | P1–P2 |
-| 4 | SQL Injection / Command Injection | P1–P2 |
-| 5 | Sensitive data exposure / cross-tenant leakage | P1–P3 |
-| 6 | Stored XSS with real impact (ATO chain) | P2–P3 |
-| 7 | Business logic flaws (price tampering, step-skip) | P2–P3 |
+| `https://www.bookbeat.com` | Web application | Medium |
+| `https://api.bookbeat.com` | API | Medium |
+| `https://search-api.bookbeat.com` | API | Medium |
+| `edge.bookbeat.com` | API | Medium |
+| Android app — `com.bookbeat.android` | Mobile | Medium |
+| iOS app — `id1056652614` | Mobile | Medium |
 
-## Out-of-Scope Bug Classes (DO NOT REPORT)
+## Rewards (CVSS-based + business impact)
 
-- Tesla account MFA issues
-- WAF bypass (standalone)
-- Open redirects / lack of security speedbump
-- Self-XSS
-- Text injection
-- Email spoofing (SPF/DKIM/DMARC/From)
-- Clickjacking (standalone)
-- CSRF on non-integrity actions (login/logout, contact forms)
-- Missing Secure/HTTPOnly cookie flags
-- Lack of rate limiting
-- Login/forgot-password brute force, account lockout, weak password policy
-- HTTPS mixed content
-- Username/email enumeration via error messages
-- Missing HTTP security headers
-- TLS/SSL issues (BEAST, BREACH, bad ciphers, expired certs)
-- Denial of Service
-- Out-of-date software (unless PoC of exploitation)
-- Known-vulnerable components (unless PoC of exploitation)
-- Internal IP disclosure
-- Non-sensitive file disclosure (README, robots.txt, .gitignore, WSDL, pprof)
-- Descriptive error messages / stack traces / path disclosure
-- Fingerprinting / banner disclosure on common services
-- Physical attacks
+| Severity | Reward |
+|---|---|
+| Low | €100 |
+| Medium | €300 |
+| High | €1,000 |
+| Critical | €2,000 |
 
-## Rules of Engagement Reminders
+Duplicate/systemic issues are paid on a sliding scale (1st: 100% … 6th+: 10%).
 
-1. **Own account only.** Use two of your own accounts to demonstrate cross-account bugs.
-2. **Stop & report within 24h** if you find access to another user's data — do NOT pull the data.
-3. **No brute force / DoS** without prior written approval.
-4. **No automated form spam** — respect rate limits organically.
-5. **Register with** `username@bugcrowdninja.com` email.
-6. **Delete any inadvertently accessed data**, prove deletion, confirm to Tesla.
+---
+
+## CRITICAL Hunting Requirements (non-negotiable)
+
+1. **User-Agent must contain ` yeswehack `** on EVERY request. This whitelists your traffic with their security team. **Without it, you get blocked.**
+2. **No automated scanners / no high-traffic tooling.** No mass directory brute-force, no aggressive fuzzing, no traffic floods.
+3. **No DoS / no service degradation.**
+4. **Never leak, copy, modify, or destroy user data.**
+5. **Use YesWeHack email aliases** (with keyword "Bug Bounty") for account creation and any contact-form interaction.
+6. **No public disclosure** — full, partial, or otherwise.
+7. **API authentication:**
+   - Route: `POST https://api.bookbeat.com/api/login`
+   - Body: `{"username": "<you>", "password": "<you>"}`
+   - Headers: `bb-client: BookBeatApp`, `bb-device: api ywh`
+
+---
+
+## Qualifying (In-Scope) Vulnerability Classes — Prioritized
+
+| Priority | Class | BookBeat-specific angle |
+|---|---|---|
+| 1 | IDOR | Other users' library, profile, payment info, reading progress via API object refs |
+| 2 | Horizontal/Vertical Privilege Escalation | Cross-account access; user→admin |
+| 3 | Business Logic (real impact) | Free premium content, trial/subscription abuse, family-plan seat abuse |
+| 4 | Auth bypass / broken authentication | Token handling across the 3 APIs |
+| 5 | SQLi | search-api is a prime candidate |
+| 6 | SSRF / LFI / RFI / XXE / XSPA | Any import/fetch/upload feature (NOTE: blind SSRF w/o PoC = out) |
+| 7 | XSS (impacting other users) | Stored/reflected with cross-user impact (self-XSS = out) |
+| 8 | CORS / CSRF with real security impact | Must show genuine impact |
+| 9 | Open Redirect | In scope (but unexploitable header-based = out) |
+| 10 | Exposed secrets/credentials | Only on in-scope assets affecting scope |
+
+---
+
+## NON-Qualifying (Out-of-Scope) — DO NOT REPORT
+
+- Broken link / social media hijacking, tabnabbing
+- Missing cookie flags, missing security headers (w/o exploit)
+- Content/text injection, CSV injection
+- Clickjacking / UI redressing
+- DoS
+- CVEs patched <30 days ago; CVEs/open ports without PoC
+- Social engineering
+- Autocomplete attribute presence
+- Outdated-browser/platform-only issues
+- Self-XSS or XSS that can't impact others
+- Hypothetical/best-practice findings without PoC
+- SSL/TLS issues (expired certs, etc.)
+- Unexploitable issues (self-XSS, header-based open redirect)
+- MITM / physical-access scenarios
+- Low-severity CSRF (logout/login/cart updates)
+- Email security records (SPF/DKIM/DMARC)
+- Session management (expiration, logout-on-pw-change, concurrent sessions)
+- User enumeration (email/alias/GUID/phone)
+- Weak password policy
+- Spam/flooding (email/SMS/DM)
+- Misconfigured public API keys (Google Maps/Firebase/analytics)
+- Password reset token via HTTP referer to external services
+- Secrets gathered from third-party/out-of-scope assets
+- Pre-account-takeover via OAuth
+- **GraphQL introspection enabled** (out!)
+- Task hijacking, crashing your own app
+- Rate-limiting / brute-force / captcha issues
+- **Blind SSRF without PoC** (DNS/HTTP pingback, WP XMLRPC)
+- Subdomain takeover without full PoC
+- Mobile: lack of obfuscation/SSL-pinning/root-detection/anti-debug, rooted/jailbroken-only, obsolete-OS-only, outdated-binary-only, internal DB encryption
+
+---
+
+## Rules of Engagement — Operating Reminders
+
+- **Own accounts only.** Use two of your own accounts (A & B) to demonstrate IDOR/BAC.
+- **Stop immediately** if you can reach another user's data — capture minimal proof, do NOT harvest, report it.
+- **Throttle everything.** Manual, surgical requests — no scanners.
+- **Every request carries the ` yeswehack ` User-Agent.**
+- **Register/contact** only with YesWeHack email aliases.
