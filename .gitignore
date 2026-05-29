@@ -1,0 +1,24 @@
+# Recon output (may contain sensitive findings)
+recon/output/
+
+# Downloaded wordlists (large files, re-download via install.sh)
+recon/wordlists/subdomains.txt
+
+# API keys / secrets
+.env
+*.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Temp files
+*.tmp
+*.bak
